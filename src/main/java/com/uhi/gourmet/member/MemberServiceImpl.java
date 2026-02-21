@@ -1,0 +1,276 @@
+package com.uhi.gourmet.member;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.security.SecureRandom;
+import java.util.stream.Collectors;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import com.uhi.gourmet.store.StoreMapper;
+import com.uhi.gourmet.store.StoreVO;
+import com.uhi.gourmet.book.BookService;
+import com.uhi.gourmet.book.BookVO;
+import com.uhi.gourmet.wait.WaitService;
+import com.uhi.gourmet.wait.WaitVO;
+
+@Service
+public class MemberServiceImpl implements MemberService {
+
+    @Autowired
+    private MemberMapper memberMapper;
+
+    @Autowired
+    private StoreMapper storeMapper; 
+
+    @Autowired
+    private BCryptPasswordEncoder pwEncoder;
+
+    @Autowired
+    private BookService book_service;
+
+    @Autowired
+    private WaitService wait_service;
+
+    /**
+     * 일반 회원 가입
+     * 단일 테이블 INSERT지만 트랜잭션을 통해 안전하게 커밋을 보장합니다.
+     */
+    @Override
+    @Transactional
+    public void joinMember(MemberVO member) {
+        member.setUser_pw(pwEncoder.encode(member.getUser_pw()));
+        member.setUser_role("ROLE_USER");
+        memberMapper.join(member);
+    }
+
+    /**
+     * 점주 회원 가입 (1단계 계정 + 2단계 가게 정보)
+     * 두 테이블(MEMBERS, STORE)에 대한 입력이 모두 성공해야 최종 커밋됩니다.
+     */
+    @Override
+    @Transactional
+    public void joinOwner(MemberVO member, StoreVO store) {
+        // 1. 회원 계정 생성
+        member.setUser_pw(pwEncoder.encode(member.getUser_pw()));
+        member.setUser_role("ROLE_OWNER");
+        memberMapper.join(member);
+        
+        // 2. 가게 정보 생성 (생성된 회원 ID 연동)
+        if (store == null) {
+            throw new IllegalArgumentException("점주 가입을 위한 가게 정보가 필요합니다.");
+        }
+        if (store.getStore_id() <= 0) {
+            store.setStore_id(storeMapper.getNextStoreId());
+        }
+        store.setUser_id(member.getUser_id());
+        storeMapper.insertStore(store);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public MemberVO getMember(String userId) {
+        return memberMapper.getMemberById(userId);
+    }
+
+    /**
+     * 회원 정보 수정
+     * 비밀번호를 입력하지 않았을 경우(null), 기존 비밀번호를 유지하도록 처리합니다.
+     */
+    @Override
+    @Transactional
+    public void updateMember(MemberVO member) {
+        if (member.getUser_pw() != null && !member.getUser_pw().trim().isEmpty()) {
+            member.setUser_pw(pwEncoder.encode(member.getUser_pw()));
+        } else {
+            // Mapper XML에서 <if test="user_pw != null"> 처리가 필요합니다.
+            member.setUser_pw(null);
+        }
+        memberMapper.updateMember(member);
+    }
+
+    @Override
+    @Transactional
+    public void deleteMember(String userId) {
+        memberMapper.deleteMemberCascade(userId);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public int checkIdDuplicate(String userId) {
+        return memberMapper.idCheck(userId);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public String findUserIdByNameEmail(String name, String email) {
+        return memberMapper.findUserIdByNameEmail(name, email);
+    }
+
+    @Override
+    @Transactional
+    public String resetPasswordByIdEmail(String userId, String email) {
+        int matched = memberMapper.countByIdEmail(userId, email);
+        if (matched == 0) {
+            return null;
+        }
+        String tempPassword = generateTempPassword();
+        memberMapper.updatePassword(userId, pwEncoder.encode(tempPassword));
+        return tempPassword;
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public boolean hasMemberByIdEmail(String userId, String email) {
+        return memberMapper.countByIdEmail(userId, email) > 0;
+    }
+
+    /**
+     * 마이페이지 통합 요약 로직
+     * 조회 성능 향상을 위해 readOnly 트랜잭션을 적용합니다.
+     */
+//    @Override
+//    @Transactional(readOnly = true)
+//    public Map<String, Object> getMyStatusSummary(String userId) {
+//        Map<String, Object> summary = new HashMap<>();
+//        
+//        List<BookVO> my_book_list = book_service.get_my_book_list(userId);
+//        List<WaitVO> my_wait_list = wait_service.get_my_wait_list(userId);
+//        
+//        if (my_book_list == null) my_book_list = new ArrayList<>();
+//        if (my_wait_list == null) my_wait_list = new ArrayList<>();
+//        
+//        // 1. 현재 이용 중인 서비스 필터링 (WAITING, CALLED, RESERVED 등)
+//        summary.put("activeWait", my_wait_list.stream()
+//            .filter(w -> "WAITING".equals(w.getWait_status()) || "CALLED".equals(w.getWait_status()) || "ING".equals(w.getWait_status()))
+//            .findFirst().orElse(null));
+//            
+//        summary.put("activeBook", my_book_list.stream()
+//            .filter(b -> "RESERVED".equals(b.getBook_status()) || "ING".equals(b.getBook_status()))
+//            .findFirst().orElse(null));
+//        
+//        // 내 앞 대기팀 수 계산 (여기에!)
+//        // activeWait를 먼저 꺼냄
+//        WaitVO activeWait = (WaitVO) summary.get("activeWait");
+//        if (activeWait != null && ("WAITING".equals(activeWait.getWait_status()) || "CALLED".equals(activeWait.getWait_status()))) {
+//            int aheadCount = wait_service.getTeamsAheadToday(activeWait.getStore_id(), activeWait.getWait_num());
+//            summary.put("aheadCount", aheadCount);
+//        }
+//
+//        // 2. 방문 완료 히스토리 추출 (FINISH 상태)
+//        List<WaitVO> finishedWaits = my_wait_list.stream()
+//            .filter(w -> "FINISH".equals(w.getWait_status())).collect(Collectors.toList());
+//        
+//        List<BookVO> finishedBooks = my_book_list.stream()
+//            .filter(b -> "FINISH".equals(b.getBook_status())).collect(Collectors.toList());
+//
+//        summary.put("finishedWaits", finishedWaits);
+//        summary.put("finishedBooks", finishedBooks);
+//        
+//        // 3. 미작성 리뷰 개수 계산 (review_id가 없는 항목 합산)
+//        long pendingReviewCount = finishedWaits.stream().filter(w -> w.getReview_id() == null).count()
+//                                + finishedBooks.stream().filter(b -> b.getReview_id() == null).count();
+//        
+//        summary.put("pendingReviewCount", pendingReviewCount);
+//        summary.put("my_book_list", my_book_list);
+//        summary.put("my_wait_list", my_wait_list);
+//        
+//        return summary;
+//    }
+    
+    @Override
+    @Transactional(readOnly = true)
+    public Map<String, Object> getMyStatusSummary(String userId) {
+        Map<String, Object> summary = new HashMap<>();
+        
+        List<BookVO> my_book_list = book_service.get_my_book_list(userId);
+        List<WaitVO> my_wait_list = wait_service.get_my_wait_list(userId);
+        
+        if (my_book_list == null) my_book_list = new ArrayList<>();
+        if (my_wait_list == null) my_wait_list = new ArrayList<>();
+        
+        // 1. 현재 이용 중인 서비스 필터링
+        // ★ 웨이팅: 상태 기준 필터링
+        summary.put("activeWait", my_wait_list.stream()
+            .filter(w -> "WAITING".equals(w.getWait_status()) || 
+                         "CALLED".equals(w.getWait_status()) || 
+                         "ING".equals(w.getWait_status()))
+            .findFirst().orElse(null));
+        
+        // ★ 예약: 시간순으로 가장 가까운 예약 선택 (RESERVED 또는 ING 상태만)
+        summary.put("activeBook", my_book_list.stream()
+            .filter(b -> "RESERVED".equals(b.getBook_status()) || "ING".equals(b.getBook_status()))
+            .min((b1, b2) -> b1.getBook_date().compareTo(b2.getBook_date()))  // ★ 시간순 정렬
+            .orElse(null));
+        
+        // 내 앞 대기팀 수 계산
+        WaitVO activeWait = (WaitVO) summary.get("activeWait");
+        if (activeWait != null && ("WAITING".equals(activeWait.getWait_status()) || 
+                                   "CALLED".equals(activeWait.getWait_status()))) {
+            int aheadCount = wait_service.getTeamsAheadToday(activeWait.getStore_id(), activeWait.getWait_num());
+            summary.put("aheadCount", aheadCount);
+        }
+
+        // 2. 방문 완료 히스토리 추출 (최근 3개만)
+        List<WaitVO> finishedWaits = my_wait_list.stream()
+            .filter(w -> "FINISH".equals(w.getWait_status()) || "CANCELLED".equals(w.getWait_status()))
+            .limit(3)  // ★ 최근 3개만
+            .collect(Collectors.toList());
+        
+        List<BookVO> finishedBooks = my_book_list.stream()
+            .filter(b -> "FINISH".equals(b.getBook_status()) || 
+                         "CANCELED".equals(b.getBook_status()) || 
+                         "NOSHOW".equals(b.getBook_status()))
+            .limit(3)  // ★ 최근 3개만
+            .collect(Collectors.toList());
+
+        summary.put("finishedWaits", finishedWaits);
+        summary.put("finishedBooks", finishedBooks);
+        
+        // 3. 미작성 리뷰 개수 계산
+        long pendingReviewCount = my_wait_list.stream()
+            .filter(w -> "FINISH".equals(w.getWait_status()) && w.getReview_id() == null)
+            .count()
+            + my_book_list.stream()
+            .filter(b -> "FINISH".equals(b.getBook_status()) && b.getReview_id() == null)
+            .count();
+        
+        summary.put("pendingReviewCount", pendingReviewCount);
+        summary.put("my_book_list", my_book_list);
+        summary.put("my_wait_list", my_wait_list);
+        
+        return summary;
+    }
+
+    private String generateTempPassword() {
+        SecureRandom random = new SecureRandom();
+        String upper = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+        String lower = "abcdefghijkmnopqrstuvwxyz";
+        String digits = "23456789";
+        String special = "!@#$%^&*";
+        String all = upper + lower + digits + special;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(upper.charAt(random.nextInt(upper.length())));
+        sb.append(lower.charAt(random.nextInt(lower.length())));
+        sb.append(digits.charAt(random.nextInt(digits.length())));
+        sb.append(special.charAt(random.nextInt(special.length())));
+        for (int i = 0; i < 6; i++) {
+            sb.append(all.charAt(random.nextInt(all.length())));
+        }
+
+        char[] chars = sb.toString().toCharArray();
+        for (int i = chars.length - 1; i > 0; i--) {
+            int j = random.nextInt(i + 1);
+            char tmp = chars[i];
+            chars[i] = chars[j];
+            chars[j] = tmp;
+        }
+        return new String(chars);
+    }
+}
